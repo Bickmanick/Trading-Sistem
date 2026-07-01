@@ -3,16 +3,23 @@
 SISTEMA DE ANALISIS MULTI-TIMEFRAME
 Uso: python main.py SYMBOL
      python main.py NVDA
-     python main.py AAPL 2024-01-01 2026-06-01
+     python main.py AAPL 2024-01-01
 """
 import sys, os, time
+from datetime import datetime, timezone
 import pandas as pd
 from config import TF_NAMES, OUTPUT_DIR
 
-def run(symbol: str, from_date="2024-01-01", to_date="2026-06-17"):
+
+def run(symbol: str, from_date="2024-01-01", to_date=None):
+    # Si no se pasa fecha de fin, se usa hoy automáticamente
+    if to_date is None:
+        to_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     t0 = time.time()
     print(f"\n{'='*60}")
     print(f"  TRADING SYSTEM — {symbol}")
+    print(f"  Período: {from_date} → {to_date}")
     print(f"{'='*60}\n")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out = os.path.join(OUTPUT_DIR, symbol)
@@ -45,7 +52,6 @@ def run(symbol: str, from_date="2024-01-01", to_date="2026-06-17"):
     state = build_state_matrix(tfs_ind["1M"], tfs_ind)
     print(f"  State matrix: {state.shape[0]:,} filas × {state.shape[1]:,} columnas")
     state.to_csv(os.path.join(out, "state_matrix.csv"))
-    print(f"  Guardado: state_matrix.csv")
 
     # ── 5. Event Detection ────────────────────────────────────────
     print("\n[5/9] Detectando eventos...")
@@ -59,7 +65,7 @@ def run(symbol: str, from_date="2024-01-01", to_date="2026-06-17"):
     regime_dist = state["regime"].value_counts()
     print("  Distribución de regímenes:")
     for r, n in regime_dist.items():
-        pct = n/len(state)*100
+        pct = n / len(state) * 100
         print(f"    {r:<25} {n:>8,} velas ({pct:.1f}%)")
 
     # ── 7. Thesis ─────────────────────────────────────────────────
@@ -89,9 +95,9 @@ def run(symbol: str, from_date="2024-01-01", to_date="2026-06-17"):
     trades = run_trade_cycle(state, patterns)
     if not trades.empty:
         trades.to_csv(os.path.join(out, "trades.csv"), index=False)
-        wr = (trades["pnl_pct"]>0).mean()
+        wr      = (trades["pnl_pct"] > 0).mean()
         avg_pnl = trades["pnl_pct"].mean()
-        n_t = len(trades)
+        n_t     = len(trades)
         print(f"\n  RESUMEN DE TRADES ({symbol}):")
         print(f"  Total trades:    {n_t}")
         print(f"  Win rate:        {wr:.1%}")
@@ -108,14 +114,16 @@ def run(symbol: str, from_date="2024-01-01", to_date="2026-06-17"):
     print(f"  COMPLETADO en {elapsed:.1f}s — outputs en output/{symbol}/")
     print(f"{'='*60}\n")
 
+
 if __name__ == "__main__":
     from multiprocessing import freeze_support
     freeze_support()
     if len(sys.argv) < 2:
         print("Uso: python main.py SYMBOL [from_date] [to_date]")
-        print("Ej:  python main.py NVDA 2024-01-01 2026-06-01")
+        print("Ej:  python main.py NVDA 2024-01-01")
+        print("     python main.py NVDA  (descarga hasta hoy automáticamente)")
         sys.exit(1)
     sym = sys.argv[1].upper()
     fd  = sys.argv[2] if len(sys.argv) > 2 else "2024-01-01"
-    td  = sys.argv[3] if len(sys.argv) > 3 else "2026-06-17"
+    td  = sys.argv[3] if len(sys.argv) > 3 else None  # None = hoy automático
     run(sym, fd, td)
