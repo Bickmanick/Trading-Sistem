@@ -1,6 +1,20 @@
 """
 MODULO 5 - DETECTOR DE MOVIMIENTOS
 
+Fixes v2:
+  - Bug precio_extremo: en la barra que dispara AGOTAMIENTO, el extremo
+    se actualizaba ANTES de chequear el retroceso. Si esa barra retrocedia
+    fuertemente, sobreescribia el extremo real con un valor cercano al
+    precio_fin -> rango casi 0 -> fib_agotamiento siempre 1.0.
+    Fix: guardar el extremo ANTES de actualizar en la barra actual, y
+    usar ese extremo previo tanto para chequear retroceso como para cerrar.
+  - Bug precio_inicio: se usaba close de la barra del evento. El movimiento
+    empieza realmente en el open de esa misma barra (el evento ocurre
+    al cierre, pero el precio de entrada es el open de la barra siguiente).
+    Fix: precio_inicio = open de la barra siguiente (next_open), con
+    fallback a close si no hay siguiente.
+  - _link_movements vectorizado con merge_asof en vez de loop fila a fila.
+
 Criterios de INICIO de movimiento:
   1. CHoCH confirmado (cambio de estructura)
   2. BOS en nueva direccion (impulso sin CHoCH previo)
@@ -27,21 +41,19 @@ TF_MINUTES = {"1M": 1, "5M": 5, "15M": 15, "30M": 30,
                "1H": 60, "4H": 240, "1D": 1440, "1W": 10080}
 TF_ORDER   = ["1M", "5M", "15M", "30M", "1H", "4H", "1D", "1W"]
 
-# Retroceso minimo desde el extremo para considerar agotamiento
 EXHAUSTION_PCT = {
     "1M":  0.30, "5M":  0.50, "15M": 0.80, "30M": 1.00,
     "1H":  1.50, "4H":  2.50, "1D":  4.00, "1W":  6.00,
 }
-# Duracion minima en barras para que un movimiento sea valido
 MIN_BARS = 3
 
 
 def _close_active(active: dict, idx, row, tf_mins: int) -> dict:
-    """Cierra el movimiento activo con los datos de la barra actual."""
+    """Cierra el movimiento activo. precio_extremo ya debe estar fijado antes de llamar."""
     active["timestamp_fin"] = idx
     active["precio_fin"]    = row.get("close", np.nan)
     pi = active["precio_inicio"]
-    pe = active["precio_extremo"]
+    pe = active["precio_extremo"]  # extremo fijado ANTES de la barra de cierre
     if active["direccion"] == "LONG":
         active["magnitud_pct"] = round((pe - pi) / pi * 100, 4) if pi else 0
     else:
@@ -55,37 +67,54 @@ def _extract_movements(df_struct: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     tf_mins  = TF_MINUTES.get(tf_name, 1)
     exh_pct  = EXHAUSTION_PCT.get(tf_name, 1.5)
 
-    for idx, row in df_struct.iterrows():
-        ce  = row.get("choch_event", "NONE")
-        bos = row.get("bos_event",   "NONE")
+    # Precalcular opens desplazados para precio_inicio correcto
+    opens = df_struct["open"].values if "open" in df_struct.columns else None
+    idx_list = list(df_struct.index)
+    n_bars   = len(idx_list)
+
+    for bar_i, (idx, row) in enumerate(df_struct.iterrows()):
+        ce    = row.get("choch_event", "NONE")
+        bos   = row.get("bos_event",   "NONE")
         close = row.get("close", np.nan)
+        high  = row.get("high",  close)
+        low   = row.get("low",   close)
+
+        # precio de entrada = open de la SIGUIENTE barra (o close si es la ultima)
+        if opens is not None and bar_i + 1 < n_bars:
+            next_open = float(opens[bar_i + 1])
+        else:
+            next_open = float(close) if not pd.isna(close) else np.nan
 
         # --- Actualizar extremo del movimiento activo ---
         if active:
+            # FIX: guardar extremo ANTES de actualizar con la barra actual
+            pe_prev = active["precio_extremo"]
+
             if active["direccion"] == "LONG":
-                if row.get("high", active["precio_extremo"]) > active["precio_extremo"]:
-                    active["precio_extremo"] = row["high"]
+                if high > active["precio_extremo"]:
+                    active["precio_extremo"] = high
             else:
-                if row.get("low", active["precio_extremo"]) < active["precio_extremo"]:
-                    active["precio_extremo"] = row["low"]
+                if low < active["precio_extremo"]:
+                    active["precio_extremo"] = low
             active["duracion_barras"] += 1
 
-            # Criterio 3: agotamiento por retroceso desde extremo
-            pe = active["precio_extremo"]
+            # Criterio 3: agotamiento — usar pe_prev (extremo antes de esta barra)
+            pe = pe_prev  # extremo real alcanzado hasta la barra anterior
             if pe and pe > 0:
                 if active["direccion"] == "LONG":
                     retroceso = (pe - close) / pe * 100
                 else:
                     retroceso = (close - pe) / pe * 100
                 if retroceso >= exh_pct and active["duracion_barras"] >= MIN_BARS:
+                    # Restaurar extremo previo para que el calculo de fib sea correcto
+                    active["precio_extremo"] = pe_prev
                     active = _close_active(active, idx, row, tf_mins)
                     active["cierre_tipo"] = "AGOTAMIENTO"
                     rows.append(active)
                     active = None
-                    # No abrir nuevo movimiento — esperamos CHoCH o BOS
                     continue
 
-            # Criterio 2: BOS contrario cierra el movimiento activo
+            # Criterio 2: BOS contrario
             if active:
                 if active["direccion"] == "LONG" and bos == "BOS_BEAR":
                     if active["duracion_barras"] >= MIN_BARS:
@@ -101,7 +130,7 @@ def _extract_movements(df_struct: pd.DataFrame, tf_name: str) -> pd.DataFrame:
                         rows.append(active)
                     active = None
 
-        # --- Criterio 1: CHoCH confirma giro y cierra + abre nuevo ---
+        # --- Criterio 1: CHoCH ---
         if ce == "CHOCH_ALCISTA":
             if active and active["direccion"] == "SHORT":
                 if active["duracion_barras"] >= MIN_BARS:
@@ -109,15 +138,15 @@ def _extract_movements(df_struct: pd.DataFrame, tf_name: str) -> pd.DataFrame:
                     active["cierre_tipo"] = "CHOCH"
                     rows.append(active)
                 active = None
-            # Abrir nuevo LONG solo si no hay uno ya activo en la misma direccion
             if not active or active["direccion"] != "LONG":
                 mov_id += 1
                 active = {
                     "mov_id": f"{tf_name}_{mov_id}", "tf": tf_name,
                     "direccion": "LONG", "timestamp_inicio": idx,
-                    "timestamp_fin": None, "precio_inicio": close,
+                    "timestamp_fin": None,
+                    "precio_inicio": next_open,  # FIX: open de barra siguiente
                     "precio_fin": np.nan,
-                    "precio_extremo": row.get("high", close),
+                    "precio_extremo": high,
                     "magnitud_pct": 0.0, "duracion_barras": 1,
                     "duracion_min": 0, "tf_parent_id": None,
                     "cierre_tipo": None
@@ -135,24 +164,25 @@ def _extract_movements(df_struct: pd.DataFrame, tf_name: str) -> pd.DataFrame:
                 active = {
                     "mov_id": f"{tf_name}_{mov_id}", "tf": tf_name,
                     "direccion": "SHORT", "timestamp_inicio": idx,
-                    "timestamp_fin": None, "precio_inicio": close,
+                    "timestamp_fin": None,
+                    "precio_inicio": next_open,  # FIX: open de barra siguiente
                     "precio_fin": np.nan,
-                    "precio_extremo": row.get("low", close),
+                    "precio_extremo": low,
                     "magnitud_pct": 0.0, "duracion_barras": 1,
                     "duracion_min": 0, "tf_parent_id": None,
                     "cierre_tipo": None
                 }
 
-        # --- Criterio 2: BOS sin CHoCH previo abre nuevo movimiento ---
         elif ce == "NONE" and not active:
             if bos == "BOS_BULL":
                 mov_id += 1
                 active = {
                     "mov_id": f"{tf_name}_{mov_id}", "tf": tf_name,
                     "direccion": "LONG", "timestamp_inicio": idx,
-                    "timestamp_fin": None, "precio_inicio": close,
+                    "timestamp_fin": None,
+                    "precio_inicio": next_open,
                     "precio_fin": np.nan,
-                    "precio_extremo": row.get("high", close),
+                    "precio_extremo": high,
                     "magnitud_pct": 0.0, "duracion_barras": 1,
                     "duracion_min": 0, "tf_parent_id": None,
                     "cierre_tipo": None
@@ -162,15 +192,15 @@ def _extract_movements(df_struct: pd.DataFrame, tf_name: str) -> pd.DataFrame:
                 active = {
                     "mov_id": f"{tf_name}_{mov_id}", "tf": tf_name,
                     "direccion": "SHORT", "timestamp_inicio": idx,
-                    "timestamp_fin": None, "precio_inicio": close,
+                    "timestamp_fin": None,
+                    "precio_inicio": next_open,
                     "precio_fin": np.nan,
-                    "precio_extremo": row.get("low", close),
+                    "precio_extremo": low,
                     "magnitud_pct": 0.0, "duracion_barras": 1,
                     "duracion_min": 0, "tf_parent_id": None,
                     "cierre_tipo": None
                 }
 
-    # Ultimo movimiento abierto: cerrar en la ultima barra disponible
     if active and active["duracion_barras"] >= MIN_BARS:
         last_idx = df_struct.index[-1]
         last_row = df_struct.iloc[-1]
@@ -182,24 +212,42 @@ def _extract_movements(df_struct: pd.DataFrame, tf_name: str) -> pd.DataFrame:
 
 
 def _link_movements(all_movs: dict) -> pd.DataFrame:
+    """Vincula movimientos con su padre de TF superior via merge_asof."""
     frames = [df.copy() for df in all_movs.values() if not df.empty]
     if not frames:
         return pd.DataFrame()
     linked = pd.concat(frames, ignore_index=True)
     linked["timestamp_inicio"] = pd.to_datetime(linked["timestamp_inicio"], utc=True)
     linked["timestamp_fin"]    = pd.to_datetime(linked["timestamp_fin"],    utc=True)
+    linked["tf_parent_id"]     = None
 
-    for i, row in linked.iterrows():
-        tf_idx = TF_ORDER.index(row["tf"]) if row["tf"] in TF_ORDER else -1
-        if tf_idx < 0 or tf_idx >= len(TF_ORDER) - 1:
+    # Para cada TF, buscar padre en TF superior con merge_asof
+    for i, tf in enumerate(TF_ORDER[:-1]):
+        tf_up = TF_ORDER[i + 1]
+        child  = linked[linked["tf"] == tf].sort_values("timestamp_inicio")
+        parent = linked[linked["tf"] == tf_up][["mov_id", "timestamp_inicio",
+                                                  "timestamp_fin"]].copy()
+        parent = parent.rename(columns={"mov_id": "_parent_id",
+                                         "timestamp_inicio": "_p_inicio",
+                                         "timestamp_fin":    "_p_fin"})
+        parent = parent.sort_values("_p_inicio")
+        if child.empty or parent.empty:
             continue
-        parents = linked[
-            (linked["tf"] == TF_ORDER[tf_idx + 1]) &
-            (linked["timestamp_inicio"] <= row["timestamp_inicio"]) &
-            (linked["timestamp_fin"].isna() | (linked["timestamp_fin"] >= row["timestamp_inicio"]))
-        ]
-        if not parents.empty:
-            linked.at[i, "tf_parent_id"] = parents.iloc[-1]["mov_id"]
+        # merge_asof: para cada hijo encuentra el padre que empezo antes
+        merged = pd.merge_asof(
+            child[["mov_id", "timestamp_inicio"]],
+            parent,
+            left_on="timestamp_inicio",
+            right_on="_p_inicio",
+            direction="backward"
+        )
+        # Solo vincular si el padre NO ha terminado antes del inicio del hijo
+        valid = merged[merged["_p_fin"].isna() |
+                       (merged["_p_fin"] >= merged["timestamp_inicio"])]
+        id_map = dict(zip(valid["mov_id"], valid["_parent_id"]))
+        mask   = linked["mov_id"].isin(id_map)
+        linked.loc[mask, "tf_parent_id"] = linked.loc[mask, "mov_id"].map(id_map)
+
     return linked
 
 

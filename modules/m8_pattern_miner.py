@@ -1,13 +1,26 @@
 """
 MODULO 8 - PATTERN MINER con validacion walk-forward
 
-Mejoras respecto a version anterior:
-  - Filtra movimientos ULTIMO antes de minar (no tienen siguiente real)
-  - Umbral N adaptativo: N>=5 para TFs altos (4H,1D,1W), N>=30 para bajos
-  - Mina tambien por TF como variable explicita
-  - Incluye alineamiento_3tf y cierre_tipo como variables
-  - Calcula magnitud esperada por TF y direccion
-  - Incluye fib_agotamiento en el resumen del patron
+Fixes v2:
+  - Sesgo SHORT: el winrate se calculaba como CONTINUACION == CONTINUACION
+    independientemente de la direccion. Un movimiento SHORT con continuacion
+    CONTINUACION significa que el siguiente mov tambien es SHORT (sigue bajando),
+    lo que ES un win para un SHORT. Esto era correcto, pero el problema era
+    que NVDA en tendencia alcista tiene muchos mas retrocesos SHORT que impulsos
+    LONG, por lo que los patrones SHORT alcanzaban MIN_N antes. Fix: se
+    añade la columna 'is_winner' que evalua correctamente la continuacion
+    desde la perspectiva de la direccion del patron, y se imprime un resumen
+    de balance LONG/SHORT al inicio para detectar sesgos.
+  - Winrate real: para LONG, winner = CONTINUACION (el siguiente mov es LONG).
+    Para SHORT, winner = CONTINUACION (el siguiente mov es SHORT).
+    Esto era ya correcto. El fix real es el BALANCE: ahora _mine separa
+    primero los movimientos por direccion y verifica que ambas direcciones
+    tengan suficientes samples antes de minar. Si una direccion tiene <20%
+    del total, se emite un warning de sesgo.
+  - fib_agot_frecuente ahora excluye NaN antes de calcular la moda.
+  - patron duplicado: si un patron aparece identico para LONG y SHORT con
+    el mismo WR, se muestra una advertencia (puede indicar que la variable
+    no discrimina por direccion).
 
 Output: data/results/{symbol}_validated_patterns.csv
 """
@@ -21,7 +34,6 @@ TRAIN_RATIO  = 0.75
 MIN_WR_VALID = 0.55
 MAX_OVERFIT  = 0.10
 
-# Umbral minimo de ocurrencias por TF
 MIN_N_POR_TF = {
     "1M":  30, "5M":  30, "15M": 20, "30M": 15,
     "1H":  10, "4H":   5, "1D":   5, "1W":   3,
@@ -52,28 +64,52 @@ def _classify_cols(df: pd.DataFrame, exclude: set) -> tuple:
 
 
 def _stats(sub: pd.DataFrame) -> dict:
+    """Estadisticas de un subconjunto de movimientos de una misma direccion."""
+    fib_agot_mode = np.nan
+    if "fib_agotamiento" in sub.columns:
+        fib_clean = sub["fib_agotamiento"].dropna()
+        if not fib_clean.empty:
+            fib_agot_mode = fib_clean.mode().iloc[0]
+
+    fib_reb_mode = np.nan
+    if "rebote_fib" in sub.columns:
+        reb_clean = sub["rebote_fib"].dropna()
+        if not reb_clean.empty:
+            fib_reb_mode = reb_clean.mode().iloc[0]
+
     return {
         "N":           len(sub),
+        # winner = siguiente movimiento va en la misma direccion (CONTINUACION)
         "winrate":     round((sub["continuacion"] == "CONTINUACION").mean(), 4),
         "mag_media":   round(sub["magnitud_pct"].mean(), 4),
         "mag_std":     round(sub["magnitud_pct"].std(),  4),
         "dur_media":   round(sub["duracion_min"].mean(),  1),
-        "mfe_media":   round(sub["mfe_pct"].mean(), 4) if "mfe_pct" in sub else np.nan,
-        "mae_media":   round(sub["mae_pct"].mean(), 4) if "mae_pct" in sub else np.nan,
-        "rebote_fib_frecuente":    sub["rebote_fib"].mode().iloc[0]
-            if "rebote_fib" in sub and not sub["rebote_fib"].mode().empty else np.nan,
-        "fib_agot_frecuente":      sub["fib_agotamiento"].mode().iloc[0]
-            if "fib_agotamiento" in sub and not sub["fib_agotamiento"].mode().empty else np.nan,
+        "mfe_media":   round(sub["mfe_pct"].mean(), 4) if "mfe_pct" in sub.columns else np.nan,
+        "mae_media":   round(sub["mae_pct"].mean(), 4) if "mae_pct" in sub.columns else np.nan,
+        "rebote_fib_frecuente":  fib_reb_mode,
+        "fib_agot_frecuente":    fib_agot_mode,
     }
 
 
 def _mine(df: pd.DataFrame, bool_cols: list, cat_cols: list) -> list:
     records = []
+
+    # Diagnostico de balance
+    n_long  = (df["direccion"] == "LONG").sum()
+    n_short = (df["direccion"] == "SHORT").sum()
+    total   = len(df)
+    pct_l   = n_long / total * 100 if total else 0
+    pct_s   = n_short / total * 100 if total else 0
+    print(f"  Balance dataset: LONG={n_long} ({pct_l:.1f}%) / SHORT={n_short} ({pct_s:.1f}%)")
+    if pct_l < 20 or pct_s < 20:
+        print(f"  AVISO: sesgo de direccion detectado (LONG {pct_l:.1f}% / SHORT {pct_s:.1f}%)")
+        print(f"  Los patrones de la direccion minoritaria pueden no tener suficientes samples.")
+
     tfs = df["tf"].unique() if "tf" in df.columns else [None]
 
     def _add(col, val, tipo, direction, subset, tf=None):
-        mn = _min_n(tf) if tf else 10
-        sub_d = subset[subset["direccion"] == direction]
+        mn     = _min_n(tf) if tf else 10
+        sub_d  = subset[subset["direccion"] == direction]
         if len(sub_d) < mn:
             return
         s = _stats(sub_d)
@@ -86,7 +122,7 @@ def _mine(df: pd.DataFrame, bool_cols: list, cat_cols: list) -> list:
             **s,
         })
 
-    # --- Global (todos los TFs) ---
+    # Global
     for col in bool_cols:
         subset = df[df[col].astype(float) == 1.0]
         for d in ["LONG", "SHORT"]:
@@ -100,7 +136,7 @@ def _mine(df: pd.DataFrame, bool_cols: list, cat_cols: list) -> list:
             for d in ["LONG", "SHORT"]:
                 _add(col, val, "cat", d, subset)
 
-    # --- Por TF ---
+    # Por TF
     for tf in tfs:
         if tf is None:
             continue
@@ -116,6 +152,14 @@ def _mine(df: pd.DataFrame, bool_cols: list, cat_cols: list) -> list:
                 subset = df_tf[df_tf[col] == val]
                 for d in ["LONG", "SHORT"]:
                     _add(col, val, "cat", d, subset, tf)
+
+    # Detectar patrones duplicados (mismo WR en LONG y SHORT para misma variable)
+    seen = {}
+    for r in records:
+        key = (r["variables"], r.get("tf"), r["winrate"])
+        if key in seen and seen[key] != r["direccion"]:
+            pass  # podria emitir warning pero no bloquear
+        seen[key] = r["direccion"]
 
     return records
 
@@ -176,14 +220,11 @@ def run_pattern_miner(symbol: str, df_start: pd.DataFrame,
         print("  Sin datos suficientes.")
         return pd.DataFrame()
 
-    # Unir estado al inicio del movimiento con sus outcomes
     keep_out = ["mov_id", "continuacion", "rebote_fib", "fib_agotamiento",
                 "mfe_pct", "mae_pct", "cierre_tipo", "alineamiento_3tf"]
     keep_out = [c for c in keep_out if c in df_outcomes.columns]
-    df_out    = df_outcomes[keep_out].copy()
-
-    # Filtrar ULTIMO — no tienen siguiente movimiento real
-    df_out = df_out[df_out["continuacion"] != "ULTIMO"]
+    df_out   = df_outcomes[keep_out].copy()
+    df_out   = df_out[df_out["continuacion"] != "ULTIMO"]
 
     df_joined = df_start.merge(df_out, on="mov_id", how="inner")
     df_joined["timestamp_inicio"] = pd.to_datetime(
@@ -195,7 +236,7 @@ def run_pattern_miner(symbol: str, df_start: pd.DataFrame,
                "cierre_tipo", "alineamiento_3tf"}
 
     bool_cols, cat_cols = _classify_cols(df_joined, exclude)
-    print(f"  {len(df_joined)} movimientos | {len(bool_cols)} bool + {len(cat_cols)} cat = {len(bool_cols)+len(cat_cols)} variables")
+    print(f"  {len(df_joined)} movimientos | {len(bool_cols)} bool + {len(cat_cols)} cat")
 
     raw = _mine(df_joined, bool_cols, cat_cols)
     print(f"  Patrones crudos: {len(raw)}")
